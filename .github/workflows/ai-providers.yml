@@ -45,12 +45,17 @@ on:
         description: Extra harness flags, such as an engine's opt-in rewrite flag (plain options only; no --ai, --env or --publish)
         required: false
         default: ''
+      sandbox:
+        description: Validation image. node is node:22-alpine, as production; python builds the Refit commit's docker/sandbox.Dockerfile (node:22-alpine plus python3), which Python repositories and checks that need python3 require
+        type: choice
+        options: [node, python]
+        default: node
 
 permissions:
   contents: read
 
 env:
-  REFIT_DOCKER_IMAGE: node:22-alpine
+  REFIT_DOCKER_IMAGE: ${{ inputs.sandbox == 'python' && 'refit-sandbox:python' || 'node:22-alpine' }}
   # Below this a shard cannot reserve one call's maximum output, so every AI call is refused.
   MIN_SHARD_BUDGET_USD: '0.50'
 
@@ -139,10 +144,21 @@ jobs:
           cache-dependency-path: refit/package-lock.json
       - run: npm ci --no-audit --no-fund
         working-directory: refit
-      # Refit never pulls images itself.
-      - run: |
-          docker pull -q "$REFIT_DOCKER_IMAGE"
-          docker image inspect --format '{{index .RepoDigests 0}}' "$REFIT_DOCKER_IMAGE" | tee "$RUNNER_TEMP/images.txt"
+      # Refit never pulls images itself. The python sandbox is built from the benchmarked commit's own
+      # Dockerfile (its base is pinned by digest there), so no registry is involved; its image ID is
+      # recorded beside the base's digest.
+      - env:
+          SANDBOX: ${{ inputs.sandbox }}
+        run: |
+          if [ "$SANDBOX" = python ]; then
+            if [ ! -f refit/docker/sandbox.Dockerfile ]; then echo "::error::This Refit commit has no docker/sandbox.Dockerfile"; exit 1; fi
+            docker build -q -t "$REFIT_DOCKER_IMAGE" -f refit/docker/sandbox.Dockerfile refit/docker
+            base=$(sed -n 's/^FROM //p' refit/docker/sandbox.Dockerfile | head -1)
+            printf '%s (built from %s)\n' "$(docker image inspect --format '{{.Id}}' "$REFIT_DOCKER_IMAGE")" "$base" | tee "$RUNNER_TEMP/images.txt"
+          else
+            docker pull -q "$REFIT_DOCKER_IMAGE"
+            docker image inspect --format '{{index .RepoDigests 0}}' "$REFIT_DOCKER_IMAGE" | tee "$RUNNER_TEMP/images.txt"
+          fi
       - name: Run benchmark
         working-directory: refit
         env:

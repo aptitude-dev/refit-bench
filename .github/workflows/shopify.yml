@@ -51,6 +51,15 @@ on:
         type: choice
         options: [openai, anthropic]
         default: openai
+      agent:
+        description: Run the agent fixer (Claude through the Agent SDK, ANTHROPIC_API_KEY secret through the AI env file); needs size 1 and a Refit commit that declares @anthropic-ai/claude-agent-sdk
+        type: boolean
+        default: false
+      mode:
+        description: benchmark runs benchmark:shopify; sandbox-check runs only the sandbox judge on each repository, unchanged, after a trivial edit and after a type-error probe (no AI)
+        type: choice
+        options: [benchmark, sandbox-check]
+        default: benchmark
       flags:
         description: Extra benchmark:shopify flags, such as --sdk-upgrade (no --ai, no --env)
         required: false
@@ -92,9 +101,12 @@ jobs:
           OFFSET: ${{ inputs.offset }}
           SIZE: ${{ inputs.size }}
           COUNT: ${{ inputs.count }}
-          AI: ${{ inputs.ai }}
+          AI: ${{ inputs.ai || inputs.agent }}
+          AGENT: ${{ inputs.agent }}
           AI_BUDGET: ${{ inputs.ai_budget }}
         run: |
+          # One repository per shard, so each agent run gets the whole shard's time limit.
+          if [ "$AGENT" = true ] && [ "$SIZE" != 1 ]; then echo "::error::agent runs need size 1"; exit 1; fi
           total=$(jq '.repos | length' "docs/benchmarks/$LIST")
           count=$((total - OFFSET))
           if [ -n "$COUNT" ] && [ "$COUNT" -lt "$count" ]; then count=$COUNT; fi
@@ -162,7 +174,7 @@ jobs:
   shard:
     needs: [plan, snapshots]
     runs-on: ubuntu-latest
-    timeout-minutes: 300
+    timeout-minutes: ${{ inputs.agent && 360 || 300 }}
     strategy:
       fail-fast: false
       matrix:
@@ -182,6 +194,18 @@ jobs:
           cache-dependency-path: refit/package-lock.json
       - run: npm ci --no-audit --no-fund
         working-directory: refit
+      # The agent fixer's runtime: the Claude Agent SDK and the Claude Code CLI it bundles, at the
+      # versions the Refit commit's package-lock.json pins (npm ci above installed them).
+      - name: Agent runtime
+        if: inputs.agent
+        working-directory: refit
+        run: |
+          version=$(jq -r '.dependencies["@anthropic-ai/claude-agent-sdk"] // empty' package.json)
+          if [ -z "$version" ]; then echo "::error::This Refit commit does not declare @anthropic-ai/claude-agent-sdk; dispatch a commit with the agent fixer"; exit 1; fi
+          cli="$PWD/node_modules/@anthropic-ai/claude-agent-sdk-linux-x64/claude"
+          if [ ! -x "$cli" ]; then echo "::error::npm ci did not install the bundled Claude Code CLI at $cli"; exit 1; fi
+          mkdir -p "$RUNNER_TEMP/bin" && ln -sf "$cli" "$RUNNER_TEMP/bin/claude" && echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+          echo "Claude Agent SDK $(jq -r .version node_modules/@anthropic-ai/claude-agent-sdk/package.json), CLI $("$cli" --version)"
       - uses: actions/download-artifact@v4
         with:
           name: snapshots
@@ -199,19 +223,29 @@ jobs:
           SHARD: ${{ matrix.shard }}
           END: ${{ needs.plan.outputs.end }}
           FLAGS: ${{ inputs.flags }}
-          AI: ${{ inputs.ai }}
+          AI: ${{ inputs.ai || inputs.agent }}
+          AGENT: ${{ inputs.agent }}
+          MODE: ${{ inputs.mode }}
           SHARD_BUDGET: ${{ needs.plan.outputs.shard_budget }}
           MODEL: ${{ inputs.model }}
           PROVIDER: ${{ inputs.provider }}
-          OPENAI_API_KEY: ${{ inputs.ai && inputs.provider != 'anthropic' && secrets.OPENAI_API_KEY || '' }}
-          ANTHROPIC_API_KEY: ${{ inputs.ai && inputs.provider == 'anthropic' && secrets.ANTHROPIC_API_KEY || '' }}
+          OPENAI_API_KEY: ${{ inputs.ai && !inputs.agent && inputs.provider != 'anthropic' && secrets.OPENAI_API_KEY || '' }}
+          ANTHROPIC_API_KEY: ${{ (inputs.agent || inputs.ai && inputs.provider == 'anthropic') && secrets.ANTHROPIC_API_KEY || '' }}
           # The development-store proof (docs/SHOPIFY-PROOF.md); Refit never prints them.
           SHOPIFY_TEST_STORE: ${{ secrets.SHOPIFY_TEST_STORE }}
           SHOPIFY_TEST_TOKEN: ${{ secrets.SHOPIFY_TEST_TOKEN }}
           NODE_OPTIONS: --max-old-space-size=8192
         run: |
           ai=()
+          # The agent fixer runs on Anthropic only; a gpt-* model input falls back to its default.
+          if [ "$AGENT" = true ]; then
+            PROVIDER=anthropic
+            case "$MODEL" in claude-*) ;; *) MODEL=claude-sonnet-5-5 ;; esac
+          fi
+          if [ "$MODE" = sandbox-check ]; then AI=false; unset OPENAI_API_KEY ANTHROPIC_API_KEY; fi
           if [ "$AI" = true ]; then
+            # The env file holds the key: readable by this user only.
+            umask 077
             if [ "$PROVIDER" = anthropic ]; then
               case "$MODEL" in claude-*) ;; *) echo "::error::provider anthropic needs a claude-* model"; exit 1 ;; esac
               if [ -z "$ANTHROPIC_API_KEY" ]; then echo "::error::The ANTHROPIC_API_KEY secret is not set"; exit 1; fi
@@ -243,7 +277,12 @@ jobs:
             if [ "$actual" != "$sha256" ]; then echo "::error::Shopify $version snapshot is not $sha256"; exit 1; fi
           done
           mkdir -p "$RUNNER_TEMP/out"
-          npm run benchmark:shopify -- --root "$RUNNER_TEMP/root" --list "$RUNNER_TEMP/root/list.json" --output "$RUNNER_TEMP/out/run" --validate "${ai[@]}" $FLAGS
+          if [ "$MODE" = sandbox-check ]; then
+            mkdir -p "$RUNNER_TEMP/out/run"
+            npx tsx pipeline/validation-sandbox-check-cli.ts --root "$RUNNER_TEMP/root" --list "$RUNNER_TEMP/root/list.json" --output "$RUNNER_TEMP/out/run/sandbox-check.json"
+          else
+            npm run benchmark:shopify -- --root "$RUNNER_TEMP/root" --list "$RUNNER_TEMP/root/list.json" --output "$RUNNER_TEMP/out/run" --validate "${ai[@]}" $FLAGS
+          fi
           rm -f "$RUNNER_TEMP/ai.env"
           cp "$RUNNER_TEMP/images.txt" "$RUNNER_TEMP/out/images.txt"
           # The AI ledger holds spend records only, never the key.
@@ -257,7 +296,7 @@ jobs:
 
   merge:
     needs: [plan, snapshots, shard]
-    if: always()
+    if: always() && inputs.mode == 'benchmark'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

@@ -1,0 +1,271 @@
+name: Meta Graph benchmark
+
+# Runs the Refit Meta Graph benchmark (`npm run benchmark:meta --validate`) on GitHub-hosted runners,
+# one job per shard, on a frozen Meta list (docs/benchmarks/subsets/meta-*.json). Each repository
+# with a patch runs `refit run` as a customer's would: dependencies are prepared and its checks run
+# offline in Docker. Meta is never contacted. AI runs only with `ai: true`, and spends the
+# OPENAI_API_KEY secret's budget. Logs and artifacts of this public repository are public.
+on:
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: Full 40-character Refit commit SHA to benchmark
+        required: true
+      list:
+        description: Frozen Meta Graph list under docs/benchmarks
+        required: true
+        default: subsets/meta-dev-60.json
+      offset:
+        description: First repository of the first shard
+        required: true
+        default: '0'
+      size:
+        description: Repositories per shard
+        required: true
+        default: '10'
+      count:
+        description: Repositories to run from the offset (blank runs the rest of the list)
+        required: false
+        default: ''
+      ai:
+        description: Run AI patches and repair (spends the OPENAI_API_KEY or ANTHROPIC_API_KEY secret's budget)
+        type: boolean
+        default: false
+      ai_budget:
+        description: AI cap in USD for the whole run, split evenly across shards (at most 1000, the most Refit accepts)
+        required: false
+        default: '2'
+      model:
+        description: AI model (priced in pipeline/ai-budget.ts); claude-* only with provider anthropic
+        type: choice
+        options: [gpt-6.1-sol, claude-sonnet-5-5, claude-opus-5-5]
+        default: gpt-6.1-sol
+      provider:
+        description: AI backend; anthropic uses the ANTHROPIC_API_KEY secret and a claude-* model instead of OpenAI
+        type: choice
+        options: [openai, anthropic]
+        default: openai
+      agent:
+        description: Run the agent fixer (Claude through the Agent SDK, ANTHROPIC_API_KEY secret through the AI env file); needs size 1 and a Refit commit that declares @anthropic-ai/claude-agent-sdk
+        type: boolean
+        default: false
+      mode:
+        description: benchmark runs benchmark:meta; sandbox-check runs only the sandbox judge on each repository, unchanged, after a trivial edit and after a type-error probe (no AI)
+        type: choice
+        options: [benchmark, sandbox-check]
+        default: benchmark
+      flags:
+        description: Extra benchmark:meta flags
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+env:
+  REFIT_DOCKER_IMAGE: node:22-alpine
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      shards: ${{ steps.shards.outputs.shards }}
+      end: ${{ steps.shards.outputs.end }}
+      shard_budget: ${{ steps.shards.outputs.shard_budget }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: pierceluu10/Refit
+          ref: ${{ inputs.commit }}
+          token: ${{ secrets.REFIT_READ_TOKEN }}
+          sparse-checkout: docs/benchmarks
+          persist-credentials: false
+      - name: Check flags
+        env:
+          FLAGS: ${{ inputs.flags }}
+        run: |
+          if ! [[ "$FLAGS" =~ ^[A-Za-z0-9\ ._=/,-]*$ ]] || [[ " $FLAGS " =~ \ --(root|output|list|limit|resume|ai|env|publish)[\ =] ]]; then
+            echo "::error::flags may hold only plain options, and never --root, --output, --list, --limit, --resume, --ai, --env or --publish"
+            exit 1
+          fi
+      - id: shards
+        env:
+          LIST: ${{ inputs.list }}
+          OFFSET: ${{ inputs.offset }}
+          SIZE: ${{ inputs.size }}
+          COUNT: ${{ inputs.count }}
+          AI: ${{ inputs.ai || inputs.agent }}
+          AGENT: ${{ inputs.agent }}
+          AI_BUDGET: ${{ inputs.ai_budget }}
+        run: |
+          # One repository per shard, so each agent run gets the whole shard's time limit.
+          if [ "$AGENT" = true ] && [ "$SIZE" != 1 ]; then echo "::error::agent runs need size 1"; exit 1; fi
+          if [ "$(jq -r .provider "docs/benchmarks/$LIST")" != meta-graph ]; then echo "::error::$LIST is not a Meta Graph list"; exit 1; fi
+          total=$(jq '.repos | length' "docs/benchmarks/$LIST")
+          count=$((total - OFFSET))
+          if [ -n "$COUNT" ] && [ "$COUNT" -lt "$count" ]; then count=$COUNT; fi
+          if [ "$count" -le 0 ]; then echo "::error::Offset $OFFSET is past the list's $total repositories"; exit 1; fi
+          shards=$(((count + SIZE - 1) / SIZE))
+          if [ "$shards" -gt 256 ]; then echo "::error::$shards shards exceed the 256-job matrix limit; raise size"; exit 1; fi
+          echo "$count repositories in $shards shards"
+          echo "end=$((OFFSET + count))" >> "$GITHUB_OUTPUT"
+          echo "shards=$(seq 0 $((shards - 1)) | jq -cs .)" >> "$GITHUB_OUTPUT"
+          if [ "$AI" = true ]; then
+            if ! [[ "$AI_BUDGET" =~ ^[0-9]+(\.[0-9]+)?$ ]] || ! awk -v b="$AI_BUDGET" 'BEGIN { exit !(b > 0 && b <= 1000) }'; then
+              echo "::error::ai_budget must be a number above 0 and at most 1000"; exit 1
+            fi
+            echo "shard_budget=$(awk -v b="$AI_BUDGET" -v n="$shards" 'BEGIN { printf "%.4f", b / n }')" >> "$GITHUB_OUTPUT"
+            echo "AI cap: \$$AI_BUDGET for the run"
+          fi
+
+  shard:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.agent && 360 || 120 }}
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.plan.outputs.shards) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: pierceluu10/Refit
+          ref: ${{ inputs.commit }}
+          token: ${{ secrets.REFIT_READ_TOKEN }}
+          path: refit
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: refit/package-lock.json
+      - run: npm ci --no-audit --no-fund
+        working-directory: refit
+      # The agent fixer's runtime: the Claude Agent SDK and the Claude Code CLI it bundles, at the
+      # versions the Refit commit's package-lock.json pins (npm ci above installed them).
+      - name: Agent runtime
+        if: inputs.agent
+        working-directory: refit
+        run: |
+          version=$(jq -r '.dependencies["@anthropic-ai/claude-agent-sdk"] // empty' package.json)
+          if [ -z "$version" ]; then echo "::error::This Refit commit does not declare @anthropic-ai/claude-agent-sdk; dispatch a commit with the agent fixer"; exit 1; fi
+          cli="$PWD/node_modules/@anthropic-ai/claude-agent-sdk-linux-x64/claude"
+          if [ ! -x "$cli" ]; then echo "::error::npm ci did not install the bundled Claude Code CLI at $cli"; exit 1; fi
+          mkdir -p "$RUNNER_TEMP/bin" && ln -sf "$cli" "$RUNNER_TEMP/bin/claude" && echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+          echo "Claude Agent SDK $(jq -r .version node_modules/@anthropic-ai/claude-agent-sdk/package.json), CLI $("$cli" --version)"
+      # Refit never pulls images itself.
+      - run: |
+          docker pull -q "$REFIT_DOCKER_IMAGE"
+          docker image inspect --format '{{index .RepoDigests 0}}' "$REFIT_DOCKER_IMAGE" | tee "$RUNNER_TEMP/images.txt"
+      - name: Run benchmark
+        working-directory: refit
+        env:
+          LIST: ${{ inputs.list }}
+          OFFSET: ${{ inputs.offset }}
+          SIZE: ${{ inputs.size }}
+          SHARD: ${{ matrix.shard }}
+          END: ${{ needs.plan.outputs.end }}
+          FLAGS: ${{ inputs.flags }}
+          AI: ${{ inputs.ai || inputs.agent }}
+          AGENT: ${{ inputs.agent }}
+          MODE: ${{ inputs.mode }}
+          SHARD_BUDGET: ${{ needs.plan.outputs.shard_budget }}
+          MODEL: ${{ inputs.model }}
+          PROVIDER: ${{ inputs.provider }}
+          OPENAI_API_KEY: ${{ inputs.ai && !inputs.agent && inputs.provider != 'anthropic' && secrets.OPENAI_API_KEY || '' }}
+          ANTHROPIC_API_KEY: ${{ (inputs.agent || inputs.ai && inputs.provider == 'anthropic') && secrets.ANTHROPIC_API_KEY || '' }}
+          NODE_OPTIONS: --max-old-space-size=8192
+        run: |
+          ai=()
+          # The agent fixer runs on Anthropic only; a gpt-* model input falls back to its default.
+          if [ "$AGENT" = true ]; then
+            PROVIDER=anthropic
+            case "$MODEL" in claude-*) ;; *) MODEL=claude-sonnet-5-5 ;; esac
+          fi
+          if [ "$MODE" = sandbox-check ]; then AI=false; unset OPENAI_API_KEY ANTHROPIC_API_KEY; fi
+          if [ "$AI" = true ]; then
+            # The env file holds the key: readable by this user only.
+            umask 077
+            if [ "$PROVIDER" = anthropic ]; then
+              case "$MODEL" in claude-*) ;; *) echo "::error::provider anthropic needs a claude-* model"; exit 1 ;; esac
+              if [ -z "$ANTHROPIC_API_KEY" ]; then echo "::error::The ANTHROPIC_API_KEY secret is not set"; exit 1; fi
+              # Ledger per shard; the run's total is ai_budget.
+              printf 'REFIT_AI_PROVIDER=anthropic\nANTHROPIC_API_KEY=%s\nANTHROPIC_MODEL=%s\nREFIT_AI_BUDGET_USD=%s\nREFIT_AI_BUDGET_DIRECTORY=%s\n' \
+                "$ANTHROPIC_API_KEY" "$MODEL" "$SHARD_BUDGET" "$RUNNER_TEMP/ai-budget" > "$RUNNER_TEMP/ai.env"
+            else
+              case "$MODEL" in gpt-*) ;; *) echo "::error::provider openai needs a gpt-* model"; exit 1 ;; esac
+              if [ -z "$OPENAI_API_KEY" ]; then echo "::error::The OPENAI_API_KEY secret is not set"; exit 1; fi
+              # Ledger per shard; the run's total is ai_budget.
+              printf 'OPENAI_API_KEY=%s\nOPENAI_MODEL=%s\nREFIT_AI_BUDGET_USD=%s\nREFIT_AI_BUDGET_DIRECTORY=%s\n' \
+                "$OPENAI_API_KEY" "$MODEL" "$SHARD_BUDGET" "$RUNNER_TEMP/ai-budget" > "$RUNNER_TEMP/ai.env"
+            fi
+            unset OPENAI_API_KEY ANTHROPIC_API_KEY
+            ai=(--ai --env "$RUNNER_TEMP/ai.env")
+          fi
+          start=$((OFFSET + SHARD * SIZE))
+          limit=$((END - start < SIZE ? END - start : SIZE))
+          # A repository that no longer clones must not cost the shard its other rows; the
+          # benchmark records it as a clone failure.
+          node scripts/meta-benchmark-setup.mjs --root "$RUNNER_TEMP/root" --list "docs/benchmarks/$LIST" --offset "$start" --limit "$limit" \
+            || echo "::warning::Setup could not clone every repository; the benchmark records each as a clone failure."
+          mkdir -p "$RUNNER_TEMP/out"
+          if [ "$MODE" = sandbox-check ]; then
+            mkdir -p "$RUNNER_TEMP/out/run"
+            npx tsx pipeline/validation-sandbox-check-cli.ts --root "$RUNNER_TEMP/root" --list "$RUNNER_TEMP/root/list.json" --output "$RUNNER_TEMP/out/run/sandbox-check.json"
+          else
+            npm run benchmark:meta -- --root "$RUNNER_TEMP/root" --list "$RUNNER_TEMP/root/list.json" --output "$RUNNER_TEMP/out/run" --validate "${ai[@]}" $FLAGS
+          fi
+          rm -f "$RUNNER_TEMP/ai.env"
+          cp "$RUNNER_TEMP/images.txt" "$RUNNER_TEMP/out/images.txt"
+          # The AI ledger holds spend records only, never the key.
+          if [ -d "$RUNNER_TEMP/ai-budget" ]; then cp -r "$RUNNER_TEMP/ai-budget" "$RUNNER_TEMP/out/ai-budget"; fi
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shard-${{ matrix.shard }}
+          path: ${{ runner.temp }}/out
+          if-no-files-found: warn
+
+  merge:
+    needs: [plan, shard]
+    if: always() && inputs.mode == 'benchmark'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: pierceluu10/Refit
+          ref: ${{ inputs.commit }}
+          token: ${{ secrets.REFIT_READ_TOKEN }}
+          path: refit
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: refit/package-lock.json
+      - run: npm ci --no-audit --no-fund
+        working-directory: refit
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: shard-*
+          path: shards
+      - name: Merge shard results
+        env:
+          LIST: ${{ inputs.list }}
+          OFFSET: ${{ inputs.offset }}
+          END: ${{ needs.plan.outputs.end }}
+          COMMIT: ${{ inputs.commit }}
+        run: |
+          node refit/scripts/benchmark-merge.mjs --shards shards --list "$LIST" --offset "$OFFSET" --end "$END" --commit "$COMMIT" --output merged
+          cat merged/summary.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: merged
+          path: merged
+      - name: Fail on missing or duplicated repositories
+        run: |
+          if [ -s merged/missing.txt ] || [ -s merged/unexpected.txt ] || [ -s merged/duplicated.txt ]; then
+            echo "::error::Missing $(wc -l < merged/missing.txt), unexpected $(wc -l < merged/unexpected.txt), duplicated $(wc -l < merged/duplicated.txt) repositories; see merged/missing.txt"
+            exit 1
+          fi

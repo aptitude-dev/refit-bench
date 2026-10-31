@@ -216,9 +216,16 @@ jobs:
           repository: pierceluu10/Refit
           ref: ${{ inputs.commit }}
           token: ${{ secrets.REFIT_READ_TOKEN }}
-          sparse-checkout: docs/benchmarks
+          # pipeline and data: the rule proposals step reads the rule tables and the ledger.
+          sparse-checkout: |
+            docs/benchmarks
+            pipeline
+            data
           persist-credentials: false
           path: refit
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
       - uses: actions/download-artifact@v4
         with:
           pattern: shard-*
@@ -271,6 +278,23 @@ jobs:
             echo "AI spend: \$$spend"
           } > merged/summary.md
           cat merged/summary.md >> "$GITHUB_STEP_SUMMARY"
+      # Each AI fix that passed every gate as a proposed rule (docs/RULE-PROPOSALS.md in Refit), on
+      # commits that have it. Proposals only: nothing here writes Refit's ledger or rule tables.
+      - name: Rule proposals from AI fixes
+        if: always()
+        env:
+          LIST: ${{ inputs.list }}
+          COMMIT: ${{ inputs.commit }}
+        run: |
+          if [ ! -f refit/pipeline/rule-proposals-cli.ts ] || [ ! -f merged/results.json ]; then
+            echo "No rule proposals step on this commit."
+            exit 0
+          fi
+          node --experimental-strip-types --no-warnings refit/pipeline/rule-proposals-cli.ts propose \
+            --results merged/results.json --list "$LIST" --run "$GITHUB_RUN_ID" --commit "$COMMIT" \
+            --out merged --root refit
+          { echo; cat merged/rule-proposals.md; } >> merged/summary.md
+          { echo; cat merged/rule-proposals.md; } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         if: always()
         with:

@@ -184,7 +184,9 @@ jobs:
           fi
           if [ "$MODE" = sandbox-check ]; then AI=false; unset OPENAI_API_KEY ANTHROPIC_API_KEY; fi
           if [ "$AI" = true ]; then
-            # The env file holds the key: readable by this user only.
+            # The env file holds the key: readable by this user only. The umask is restored right
+            # after, or every clone and dependency archive becomes unreadable in the sandboxes.
+            previous_umask=$(umask)
             umask 077
             if [ "$PROVIDER" = anthropic ]; then
               case "$MODEL" in claude-*) ;; *) echo "::error::provider anthropic needs a claude-* model"; exit 1 ;; esac
@@ -199,6 +201,7 @@ jobs:
               printf 'OPENAI_API_KEY=%s\nOPENAI_MODEL=%s\nREFIT_AI_BUDGET_USD=%s\nREFIT_AI_BUDGET_DIRECTORY=%s\n' \
                 "$OPENAI_API_KEY" "$MODEL" "$SHARD_BUDGET" "$RUNNER_TEMP/ai-budget" > "$RUNNER_TEMP/ai.env"
             fi
+            umask "$previous_umask"
             unset OPENAI_API_KEY ANTHROPIC_API_KEY
             ai=(--ai --env "$RUNNER_TEMP/ai.env")
           fi

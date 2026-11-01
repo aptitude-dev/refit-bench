@@ -45,12 +45,18 @@ on:
         description: Extra harness flags, such as an engine's opt-in rewrite flag (plain options only; no --ai, --env or --publish)
         required: false
         default: ''
+      sandbox:
+        description: Validation images. node is node:22-alpine, as production; python builds the Refit commit's docker/sandbox.Dockerfile, node:22-alpine plus python3 for Node checks and a glibc Python image for Python repositories (REFIT_PYTHON_IMAGE)
+        type: choice
+        options: [node, python]
+        default: node
 
 permissions:
   contents: read
 
 env:
-  REFIT_DOCKER_IMAGE: node:22-alpine
+  REFIT_DOCKER_IMAGE: ${{ inputs.sandbox == 'python' && 'refit-sandbox:python' || 'node:22-alpine' }}
+  REFIT_PYTHON_IMAGE: ${{ inputs.sandbox == 'python' && 'refit-sandbox:python-glibc' || '' }}
   # Below this a shard cannot reserve one call's maximum output, so every AI call is refused.
   MIN_SHARD_BUDGET_USD: '0.50'
 
@@ -139,10 +145,24 @@ jobs:
           cache-dependency-path: refit/package-lock.json
       - run: npm ci --no-audit --no-fund
         working-directory: refit
-      # Refit never pulls images itself.
-      - run: |
-          docker pull -q "$REFIT_DOCKER_IMAGE"
-          docker image inspect --format '{{index .RepoDigests 0}}' "$REFIT_DOCKER_IMAGE" | tee "$RUNNER_TEMP/images.txt"
+      # Refit never pulls images itself. The python sandboxes are built from the benchmarked commit's
+      # own Dockerfile (bases pinned by digest there), so no registry is involved; each image ID is
+      # recorded beside its base's digest.
+      - env:
+          SANDBOX: ${{ inputs.sandbox }}
+        run: |
+          if [ "$SANDBOX" = python ]; then
+            if [ ! -f refit/docker/sandbox.Dockerfile ]; then echo "::error::This Refit commit has no docker/sandbox.Dockerfile"; exit 1; fi
+            docker build -q -t "$REFIT_DOCKER_IMAGE" -f refit/docker/sandbox.Dockerfile refit/docker
+            docker build -q --target python -t "$REFIT_PYTHON_IMAGE" -f refit/docker/sandbox.Dockerfile refit/docker
+            sed -n 's/^FROM \([^ ]*\) AS \(.*\)/\2 \1/p' refit/docker/sandbox.Dockerfile | while read -r target base; do
+              image=$([ "$target" = python ] && echo "$REFIT_PYTHON_IMAGE" || echo "$REFIT_DOCKER_IMAGE")
+              printf '%s %s (built from %s)\n' "$image" "$(docker image inspect --format '{{.Id}}' "$image")" "$base"
+            done | tee "$RUNNER_TEMP/images.txt"
+          else
+            docker pull -q "$REFIT_DOCKER_IMAGE"
+            docker image inspect --format '{{index .RepoDigests 0}}' "$REFIT_DOCKER_IMAGE" | tee "$RUNNER_TEMP/images.txt"
+          fi
       - name: Run benchmark
         working-directory: refit
         env:
